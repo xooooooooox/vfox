@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/urfave/cli/v3"
@@ -200,6 +201,45 @@ func envFlag(cmd *cli.Command) error {
 		}
 	}
 
+	// 5.5. Second-level fast path: machine-global shared cache.
+	// Sessions with session-scope state must stay on their private path in
+	// both directions: a session-scoped shell must not read a global result
+	// (it would override its `vfox use` choice), and its output must not be
+	// served to other shells. Legacy version files are resolved through
+	// plugin-declared filenames that cannot be enumerated cheaply here, so
+	// legacy-enabled setups also keep the current behavior.
+	_, hasSessionCfg := configPaths[env.Session]
+	sharedEligible := !hasSessionCfg && !runtimeEnvContext.UserConfig.LegacyVersionFile.Enable
+	var sharedCache *env.SharedEnvCache
+	var sharedKey env.SharedKeyInput
+	if sharedEligible {
+		globalStamp, gErr := env.ConfigStamp(configPaths[env.Global])
+		projectStamp, pErr := env.ConfigStamp(configPaths[env.Project])
+		if gErr != nil || pErr != nil {
+			logger.Debugf("Config stamp failed (global: %v, project: %v), skipping shared cache", gErr, pErr)
+			sharedEligible = false
+		} else {
+			sharedCache = env.NewSharedEnvCache(runtimeEnvContext.PathMeta.User.Home)
+			sharedKey = env.SharedKeyInput{
+				RuntimeVersion: internal.RuntimeVersion,
+				ShellName:      shellName,
+				Path:           os.Getenv(env.PathVarName),
+				GlobalConfig:   globalStamp,
+				ProjectConfig:  projectStamp,
+			}
+			if output, ok := sharedCache.Lookup(sharedKey); ok {
+				logger.Debugf("Using shared cached output")
+				// Backfill the session state so subsequent calls in this
+				// shell take the first-level fast path.
+				if err := state.Update(configPaths, output); err != nil {
+					logger.Debugf("Failed to update state from shared cache: %v", err)
+				}
+				fmt.Print(output)
+				return nil
+			}
+		}
+	}
+
 	// 6. Slow path: recalculate env (full computation)
 	// Process each SDK concurrently (same logic as before)
 	allTools := chain.GetAllTools()
@@ -219,6 +259,15 @@ func envFlag(cmd *cli.Command) error {
 	// Process SDKs concurrently using errgroup
 	g, _ := errgroup.WithContext(context.Background())
 
+	// A tool that errors along the way (plugin load failure, symlink or
+	// EnvKeys error — e.g. a plugin that needs the network while it is
+	// unreachable) still produces a usable output for THIS session, but that
+	// output is degraded and must not be published to the shared cache,
+	// where it would outlive the transient failure. Tools that are merely
+	// configured-but-not-installed are a normal steady state and do not
+	// count as degraded.
+	var sharedDegraded bool
+
 	for sdkName := range allTools {
 		sdkName := sdkName // Capture loop variable
 
@@ -227,6 +276,9 @@ func envFlag(cmd *cli.Command) error {
 			sdkObj, err := manager.LookupSdk(sdkName)
 			if err != nil {
 				logger.Debugf("SDK %s not found: %v", sdkName, err)
+				mu.Lock()
+				sharedDegraded = true
+				mu.Unlock()
 				return nil // Continue processing other SDKs
 			}
 
@@ -249,6 +301,9 @@ func envFlag(cmd *cli.Command) error {
 			if err := sdkObj.CreateSymlinksForScope(sdkVersion, actualScope); err != nil {
 				logger.Debugf("Failed to create symlinks for %s@%s (scope: %s): %v",
 					sdkName, sdkVersion, actualScope.String(), err)
+				mu.Lock()
+				sharedDegraded = true
+				mu.Unlock()
 				return nil // Continue processing other SDKs
 			}
 
@@ -256,6 +311,9 @@ func envFlag(cmd *cli.Command) error {
 			sdkEnvs, err := sdkObj.EnvKeysForScope(sdkVersion, actualScope)
 			if err != nil {
 				logger.Debugf("Failed to get env keys for %s@%s: %v", sdkName, sdkVersion, err)
+				mu.Lock()
+				sharedDegraded = true
+				mu.Unlock()
 				return nil // Continue processing other SDKs
 			}
 
@@ -331,6 +389,16 @@ func envFlag(cmd *cli.Command) error {
 	// 10. Update state with new output
 	if err := state.Update(configPaths, exportStr); err != nil {
 		logger.Debugf("Failed to update state: %v", err)
+	}
+
+	// 11. Publish to the shared cache — but never a degraded output (see
+	// sharedDegraded above) and never an output that references this
+	// session's shim dir (Project scope with the unlink attribute downgrades
+	// to Session symlinks): such an output is only valid inside this session.
+	if sharedEligible && !sharedDegraded && !strings.Contains(exportStr, runtimeEnvContext.PathMeta.Working.SessionSdkDir) {
+		if err := sharedCache.Store(sharedKey, exportStr); err != nil {
+			logger.Debugf("Failed to store shared cache entry: %v", err)
+		}
 	}
 
 	fmt.Print(exportStr)

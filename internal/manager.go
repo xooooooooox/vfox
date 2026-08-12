@@ -676,6 +676,9 @@ func (m *Manager) CleanTmp() {
 	}
 	_ = os.WriteFile(cleanFlagPath, []byte(strconv.FormatInt(util.GetBeginOfToday(), 10)), os.ModePerm)
 
+	// Prune the machine-global shared env cache on the same daily cadence.
+	env.NewSharedEnvCache(m.RuntimeEnvContext.PathMeta.User.Home).Prune()
+
 	procExists := make(map[string]struct{})
 
 	if procList, err := process.Pids(); err == nil {
